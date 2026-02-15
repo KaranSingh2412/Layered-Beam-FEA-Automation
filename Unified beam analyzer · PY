@@ -1,0 +1,1518 @@
+"""
+unified_beam_analyzer.py
+
+Complete Automated Beam Analysis Framework for Abaqus CAE
+
+Features:
+- GUI parameter collection
+- Multi-layer beam modeling
+- Interlayer bonding (Tie/Cohesive/Contact)
+- Concrete Damage Plasticity (CDP)
+- Static and Modal analysis
+- Result extraction and CSV export
+- Analytical validation
+
+Usage:
+    abaqus cae script=unified_beam_analyzer.py
+
+Compatible with Abaqus 6.14+
+"""
+
+from abaqus import *
+from abaqusConstants import *
+import regionToolset
+import mesh
+import job
+import visualization
+import odbAccess
+import csv
+import os
+import time
+import math
+
+# Try to import Tkinter for GUI
+try:
+    import Tkinter as tk
+    import tkMessageBox
+    from ScrolledText import ScrolledText
+except ImportError:
+    import tkinter as tk
+    from tkinter import messagebox as tkMessageBox
+    from tkinter.scrolledtext import ScrolledText
+
+
+# ==============================================================================
+# GLOBAL CONFIGURATION STORAGE
+# ==============================================================================
+
+class Config:
+    """Global configuration storage"""
+    def __init__(self):
+        self.analysis_type = 'linear_static'
+        self.geometry = {}
+        self.layers = {}
+        self.materials = []
+        self.bonding_type = 'tie'
+        self.cohesive_params = {}
+        self.mesh = {}
+        self.boundary_conditions = {}
+        self.loading = {}
+        self.output = {}
+        self.modal = {'enabled': False, 'num_modes': 5}
+        
+        # Timing
+        self.time_build = 0
+        self.time_mesh = 0
+        self.time_solve = 0
+        self.time_total = 0
+
+
+# ==============================================================================
+# GUI PARAMETER COLLECTION
+# ==============================================================================
+
+class ParameterGUI:
+    """Enhanced GUI for parameter collection"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.root = tk.Tk()
+        self.root.title("Unified Beam Analyzer - Parameter Input")
+        self.root.geometry("900x1000")
+        
+        self.create_widgets()
+        
+    def create_widgets(self):
+        """Create all GUI widgets"""
+        
+        # Main canvas with scrollbar
+        canvas = tk.Canvas(self.root)
+        scrollbar = tk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = tk.Frame(canvas)
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Title
+        title = tk.Label(self.scrollable_frame, 
+                        text="🔷 UNIFIED BEAM ANALYZER",
+                        font=("Arial", 18, "bold"), fg="navy")
+        title.pack(pady=15)
+        
+        # Create all sections
+        self.create_analysis_section()
+        self.create_geometry_section()
+        self.create_layer_section()
+        self.create_material_section()
+        self.create_bonding_section()
+        self.create_mesh_section()
+        self.create_bc_section()
+        self.create_loading_section()
+        self.create_modal_section()
+        self.create_output_section()
+        
+        # Action buttons
+        button_frame = tk.Frame(self.scrollable_frame)
+        button_frame.pack(pady=20)
+        
+        tk.Button(button_frame, text="✓ RUN ANALYSIS", 
+                 command=self.on_submit,
+                 bg="green", fg="white", 
+                 font=("Arial", 14, "bold"),
+                 width=18, height=2).pack(side=tk.LEFT, padx=10)
+        
+        tk.Button(button_frame, text="✗ CANCEL", 
+                 command=self.on_cancel,
+                 bg="red", fg="white", 
+                 font=("Arial", 14, "bold"),
+                 width=18, height=2).pack(side=tk.LEFT, padx=10)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+    def create_section_frame(self, title):
+        """Create labeled frame"""
+        frame = tk.LabelFrame(self.scrollable_frame, text=title,
+                             font=("Arial", 12, "bold"),
+                             padx=15, pady=10)
+        frame.pack(fill="x", padx=15, pady=8)
+        return frame
+    
+    def create_analysis_section(self):
+        """Analysis type"""
+        frame = self.create_section_frame("1. Analysis Type")
+        
+        self.analysis_type = tk.StringVar(value="linear_static")
+        tk.Radiobutton(frame, text="Linear Static", 
+                      variable=self.analysis_type,
+                      value="linear_static",
+                      font=("Arial", 10)).grid(row=0, column=0, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Nonlinear Static (CDP)", 
+                      variable=self.analysis_type,
+                      value="nonlinear_static",
+                      font=("Arial", 10)).grid(row=0, column=1, sticky="w", padx=5)
+    
+    def create_geometry_section(self):
+        """Geometry inputs"""
+        frame = self.create_section_frame("2. Beam Dimensions")
+        
+        tk.Label(frame, text="Length (mm):", font=("Arial", 10)).grid(
+            row=0, column=0, sticky="w", pady=5)
+        self.beam_length = tk.Entry(frame, width=15, font=("Arial", 10))
+        self.beam_length.insert(0, "1000")
+        self.beam_length.grid(row=0, column=1, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Width (mm):", font=("Arial", 10)).grid(
+            row=1, column=0, sticky="w", pady=5)
+        self.width = tk.Entry(frame, width=15, font=("Arial", 10))
+        self.width.insert(0, "50")
+        self.width.grid(row=1, column=1, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Height (mm):", font=("Arial", 10)).grid(
+            row=2, column=0, sticky="w", pady=5)
+        self.height = tk.Entry(frame, width=15, font=("Arial", 10))
+        self.height.insert(0, "100")
+        self.height.grid(row=2, column=1, sticky="w", padx=5)
+    
+    def create_layer_section(self):
+        """Layer configuration"""
+        frame = self.create_section_frame("3. Layer Configuration")
+        
+        tk.Label(frame, text="Number of Layers:", 
+                font=("Arial", 10)).grid(row=0, column=0, sticky="w", pady=5)
+        self.num_layers = tk.Spinbox(frame, from_=1, to=20, width=10,
+                                     font=("Arial", 10))
+        self.num_layers.delete(0, tk.END)
+        self.num_layers.insert(0, "3")
+        self.num_layers.grid(row=0, column=1, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Layer Thicknesses (comma-separated):",
+                font=("Arial", 10)).grid(row=1, column=0, sticky="w", pady=5)
+        tk.Label(frame, text="(Must sum to total height)",
+                font=("Arial", 8, "italic"), fg="gray").grid(
+            row=1, column=1, sticky="w", padx=5)
+        
+        self.layer_thicknesses = tk.Entry(frame, width=40, font=("Arial", 10))
+        self.layer_thicknesses.insert(0, "10, 80, 10")
+        self.layer_thicknesses.grid(row=2, column=0, columnspan=3, 
+                                   sticky="ew", padx=5, pady=5)
+    
+    def create_material_section(self):
+        """Material properties"""
+        frame = self.create_section_frame("4. Material Properties")
+        
+        tk.Label(frame, text="Format: Name, E(MPa), nu, density(kg/m³)",
+                font=("Arial", 9, "bold")).grid(row=0, column=0, 
+                                                columnspan=3, sticky="w", pady=5)
+        tk.Label(frame, text="One material per layer (one per line)",
+                font=("Arial", 8, "italic"), fg="gray").grid(
+            row=1, column=0, columnspan=3, sticky="w")
+        
+        self.materials_text = ScrolledText(frame, width=80, height=8,
+                                          font=("Courier", 9))
+        self.materials_text.insert("1.0",
+            "Concrete-Top, 30000, 0.2, 2400\n"
+            "Steel-Core, 200000, 0.3, 7850\n"
+            "Concrete-Bottom, 30000, 0.2, 2400")
+        self.materials_text.grid(row=2, column=0, columnspan=3, pady=5)
+        
+        # CDP option
+        self.use_cdp = tk.BooleanVar(value=False)
+        tk.Checkbutton(frame, 
+                      text="Use Concrete Damage Plasticity (CDP) for concrete layers",
+                      variable=self.use_cdp,
+                      font=("Arial", 10)).grid(row=3, column=0, 
+                                              columnspan=3, sticky="w", pady=5)
+    
+    def create_bonding_section(self):
+        """Interlayer bonding"""
+        frame = self.create_section_frame("5. Interlayer Bonding")
+        
+        tk.Label(frame, text="Bonding Type:", font=("Arial", 10)).grid(
+            row=0, column=0, sticky="w", pady=5)
+        
+        self.bonding_type = tk.StringVar(value="tie")
+        tk.Radiobutton(frame, text="Tie (Perfect Bond)", 
+                      variable=self.bonding_type, value="tie",
+                      font=("Arial", 10)).grid(row=0, column=1, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Cohesive Zone", 
+                      variable=self.bonding_type, value="cohesive",
+                      font=("Arial", 10)).grid(row=0, column=2, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Frictional Contact", 
+                      variable=self.bonding_type, value="contact",
+                      font=("Arial", 10)).grid(row=0, column=3, sticky="w", padx=5)
+        
+        # Cohesive parameters
+        cohesive_frame = tk.LabelFrame(frame, text="Cohesive Parameters (if selected)",
+                                      font=("Arial", 9))
+        cohesive_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=5)
+        
+        tk.Label(cohesive_frame, text="Stiffness (MPa/mm):").grid(
+            row=0, column=0, sticky="w", padx=5, pady=2)
+        self.cohesive_stiffness = tk.Entry(cohesive_frame, width=12)
+        self.cohesive_stiffness.insert(0, "1000")
+        self.cohesive_stiffness.grid(row=0, column=1, sticky="w", padx=5)
+        
+        tk.Label(cohesive_frame, text="Max Stress (MPa):").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2)
+        self.cohesive_max_stress = tk.Entry(cohesive_frame, width=12)
+        self.cohesive_max_stress.insert(0, "5")
+        self.cohesive_max_stress.grid(row=1, column=1, sticky="w", padx=5)
+        
+        tk.Label(cohesive_frame, text="Fracture Energy (N/mm):").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2)
+        self.cohesive_energy = tk.Entry(cohesive_frame, width=12)
+        self.cohesive_energy.insert(0, "0.1")
+        self.cohesive_energy.grid(row=2, column=1, sticky="w", padx=5)
+    
+    def create_mesh_section(self):
+        """Mesh parameters"""
+        frame = self.create_section_frame("6. Mesh Settings")
+        
+        tk.Label(frame, text="Element Type:", font=("Arial", 10)).grid(
+            row=0, column=0, sticky="w", pady=5)
+        self.element_type = tk.StringVar(value="C3D8R")
+        tk.Radiobutton(frame, text="C3D8R (8-node brick)", 
+                      variable=self.element_type, value="C3D8R",
+                      font=("Arial", 10)).grid(row=0, column=1, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="C3D20R (20-node brick)", 
+                      variable=self.element_type, value="C3D20R",
+                      font=("Arial", 10)).grid(row=0, column=2, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Seed Size (mm):", font=("Arial", 10)).grid(
+            row=1, column=0, sticky="w", pady=5)
+        self.seed_size = tk.Entry(frame, width=12, font=("Arial", 10))
+        self.seed_size.insert(0, "10")
+        self.seed_size.grid(row=1, column=1, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Elements Along Length:", font=("Arial", 10)).grid(
+            row=2, column=0, sticky="w", pady=5)
+        self.num_elem_length = tk.Entry(frame, width=12, font=("Arial", 10))
+        self.num_elem_length.insert(0, "20")
+        self.num_elem_length.grid(row=2, column=1, sticky="w", padx=5)
+    
+    def create_bc_section(self):
+        """Boundary conditions"""
+        frame = self.create_section_frame("7. Boundary Conditions")
+        
+        tk.Label(frame, text="Left End:", font=("Arial", 10)).grid(
+            row=0, column=0, sticky="w", pady=5)
+        self.left_bc = tk.StringVar(value="fixed")
+        tk.Radiobutton(frame, text="Fixed", variable=self.left_bc,
+                      value="fixed", font=("Arial", 10)).grid(
+            row=0, column=1, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Pinned", variable=self.left_bc,
+                      value="pinned", font=("Arial", 10)).grid(
+            row=0, column=2, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Right End:", font=("Arial", 10)).grid(
+            row=1, column=0, sticky="w", pady=5)
+        self.right_bc = tk.StringVar(value="free")
+        tk.Radiobutton(frame, text="Free", variable=self.right_bc,
+                      value="free", font=("Arial", 10)).grid(
+            row=1, column=1, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Pinned", variable=self.right_bc,
+                      value="pinned", font=("Arial", 10)).grid(
+            row=1, column=2, sticky="w", padx=5)
+    
+    def create_loading_section(self):
+        """Loading parameters"""
+        frame = self.create_section_frame("8. Loading (Static Analysis)")
+        
+        tk.Label(frame, text="Load Type:", font=("Arial", 10)).grid(
+            row=0, column=0, sticky="w", pady=5)
+        self.load_type = tk.StringVar(value="point")
+        tk.Radiobutton(frame, text="Point Load", variable=self.load_type,
+                      value="point", font=("Arial", 10)).grid(
+            row=0, column=1, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Distributed Pressure", 
+                      variable=self.load_type, value="distributed",
+                      font=("Arial", 10)).grid(row=0, column=2, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Magnitude (N or MPa):", 
+                font=("Arial", 10)).grid(row=1, column=0, sticky="w", pady=5)
+        self.load_magnitude = tk.Entry(frame, width=15, font=("Arial", 10))
+        self.load_magnitude.insert(0, "10000")
+        self.load_magnitude.grid(row=1, column=1, sticky="w", padx=5)
+        
+        tk.Label(frame, text="Direction:", font=("Arial", 10)).grid(
+            row=2, column=0, sticky="w", pady=5)
+        self.load_direction = tk.StringVar(value="Y")
+        tk.Radiobutton(frame, text="X", variable=self.load_direction,
+                      value="X", font=("Arial", 10)).grid(
+            row=2, column=1, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Y", variable=self.load_direction,
+                      value="Y", font=("Arial", 10)).grid(
+            row=2, column=2, sticky="w", padx=5)
+        tk.Radiobutton(frame, text="Z", variable=self.load_direction,
+                      value="Z", font=("Arial", 10)).grid(
+            row=2, column=3, sticky="w", padx=5)
+    
+    def create_modal_section(self):
+        """Modal analysis settings"""
+        frame = self.create_section_frame("9. Modal Analysis (Optional)")
+        
+        self.modal_enabled = tk.BooleanVar(value=False)
+        tk.Checkbutton(frame, text="Run Modal Analysis after Static",
+                      variable=self.modal_enabled,
+                      font=("Arial", 10)).grid(row=0, column=0, 
+                                              columnspan=2, sticky="w", pady=5)
+        
+        tk.Label(frame, text="Number of Modes:", font=("Arial", 10)).grid(
+            row=1, column=0, sticky="w", pady=5)
+        self.num_modes = tk.Spinbox(frame, from_=1, to=20, width=10,
+                                   font=("Arial", 10))
+        self.num_modes.delete(0, tk.END)
+        self.num_modes.insert(0, "5")
+        self.num_modes.grid(row=1, column=1, sticky="w", padx=5)
+    
+    def create_output_section(self):
+        """Output settings"""
+        frame = self.create_section_frame("10. Output Settings")
+        
+        tk.Label(frame, text="Job Name:", font=("Arial", 10)).grid(
+            row=0, column=0, sticky="w", pady=5)
+        self.job_name = tk.Entry(frame, width=30, font=("Arial", 10))
+        self.job_name.insert(0, "BeamAnalysis")
+        self.job_name.grid(row=0, column=1, sticky="w", padx=5)
+        
+        self.extract_results = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame, text="Extract Results",
+                      variable=self.extract_results,
+                      font=("Arial", 10)).grid(row=1, column=0, 
+                                              columnspan=2, sticky="w", pady=5)
+        
+        self.export_csv = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame, text="Export to CSV",
+                      variable=self.export_csv,
+                      font=("Arial", 10)).grid(row=2, column=0, 
+                                              columnspan=2, sticky="w", pady=5)
+        
+        self.validate_analytical = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame, text="Validate with Analytical Solution",
+                      variable=self.validate_analytical,
+                      font=("Arial", 10)).grid(row=3, column=0, 
+                                              columnspan=2, sticky="w", pady=5)
+    
+    def parse_materials(self, text):
+        """Parse material text"""
+        materials = []
+        lines = text.strip().split('\n')
+        
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 3:
+                mat = {
+                    'name': parts[0],
+                    'E': float(parts[1]),
+                    'nu': float(parts[2]),
+                    'density': float(parts[3]) if len(parts) > 3 else 2400.0
+                }
+                materials.append(mat)
+        
+        return materials
+    
+    def parse_thicknesses(self, text):
+        """Parse thickness list"""
+        return [float(t.strip()) for t in text.split(',')]
+    
+    def validate_and_collect(self):
+        """Validate and collect all parameters"""
+        try:
+            # Geometry
+            length = float(self.beam_length.get())
+            width = float(self.width.get())
+            height = float(self.height.get())
+            
+            # Layers
+            num_layers = int(self.num_layers.get())
+            thicknesses = self.parse_thicknesses(self.layer_thicknesses.get())
+            
+            if len(thicknesses) != num_layers:
+                raise ValueError(
+                    f"Number of thicknesses ({len(thicknesses)}) "
+                    f"must match number of layers ({num_layers})")
+            
+            if abs(sum(thicknesses) - height) > 0.01:
+                raise ValueError(
+                    f"Sum of thicknesses ({sum(thicknesses):.2f}) "
+                    f"must equal total height ({height})")
+            
+            # Materials
+            materials = self.parse_materials(self.materials_text.get("1.0", tk.END))
+            
+            if len(materials) != num_layers:
+                raise ValueError(
+                    f"Number of materials ({len(materials)}) "
+                    f"must match number of layers ({num_layers})")
+            
+            # Build config
+            self.config.analysis_type = self.analysis_type.get()
+            
+            self.config.geometry = {
+                'length': length,
+                'width': width,
+                'height': height
+            }
+            
+            self.config.layers = {
+                'number': num_layers,
+                'thicknesses': thicknesses
+            }
+            
+            self.config.materials = materials
+            self.config.use_cdp = self.use_cdp.get()
+            
+            self.config.bonding_type = self.bonding_type.get()
+            self.config.cohesive_params = {
+                'stiffness': float(self.cohesive_stiffness.get()),
+                'max_stress': float(self.cohesive_max_stress.get()),
+                'energy': float(self.cohesive_energy.get())
+            }
+            
+            self.config.mesh = {
+                'element_type': self.element_type.get(),
+                'seed_size': float(self.seed_size.get()),
+                'num_elem_length': int(self.num_elem_length.get())
+            }
+            
+            self.config.boundary_conditions = {
+                'left': self.left_bc.get(),
+                'right': self.right_bc.get()
+            }
+            
+            self.config.loading = {
+                'type': self.load_type.get(),
+                'magnitude': float(self.load_magnitude.get()),
+                'direction': self.load_direction.get()
+            }
+            
+            self.config.modal = {
+                'enabled': self.modal_enabled.get(),
+                'num_modes': int(self.num_modes.get())
+            }
+            
+            self.config.output = {
+                'job_name': self.job_name.get(),
+                'extract_results': self.extract_results.get(),
+                'export_csv': self.export_csv.get(),
+                'validate_analytical': self.validate_analytical.get()
+            }
+            
+            return True
+            
+        except Exception as e:
+            tkMessageBox.showerror("Validation Error", str(e))
+            return False
+    
+    def on_submit(self):
+        """Submit button handler"""
+        if self.validate_and_collect():
+            self.root.quit()
+            self.root.destroy()
+    
+    def on_cancel(self):
+        """Cancel button handler"""
+        self.config = None
+        self.root.quit()
+        self.root.destroy()
+    
+    def show(self):
+        """Show GUI and return config"""
+        self.root.mainloop()
+        return self.config
+
+
+# ==============================================================================
+# MODEL BUILDER FUNCTIONS
+# ==============================================================================
+
+def build_geometry(config):
+    """Build 3D beam geometry with layers"""
+    print('\n' + '='*70)
+    print('[1/12] BUILDING GEOMETRY')
+    print('='*70)
+    
+    start_time = time.time()
+    
+    # Create model
+    model_name = config.output['job_name']
+    model = mdb.Model(name=model_name)
+    
+    if 'Model-1' in mdb.models.keys():
+        del mdb.models['Model-1']
+    
+    # Geometry parameters
+    length = config.geometry['length']
+    width = config.geometry['width']
+    height = config.geometry['height']
+    
+    print(f'  Dimensions: {length} x {width} x {height} mm')
+    
+    # Create sketch
+    sketch = model.ConstrainedSketch(name='BeamProfile', sheetSize=max(width, height)*2)
+    
+    half_w = width / 2.0
+    half_h = height / 2.0
+    
+    sketch.rectangle(
+        point1=(-half_w, -half_h),
+        point2=(half_w, half_h)
+    )
+    
+    # Create part
+    part = model.Part(name='Beam', dimensionality=THREE_D, type=DEFORMABLE_BODY)
+    part.BaseSolidExtrude(sketch=sketch, depth=length)
+    
+    print('  ✓ 3D solid beam created')
+    
+    # Partition layers
+    num_layers = config.layers['number']
+    
+    if num_layers > 1:
+        print(f'  Partitioning {num_layers} layers...')
+        
+        thicknesses = config.layers['thicknesses']
+        current_z = -half_h
+        
+        for i in range(num_layers - 1):
+            current_z += thicknesses[i]
+            
+            # Create datum plane
+            datum = part.DatumPlaneByPrincipalPlane(
+                principalPlane=XYPLANE,
+                offset=current_z
+            )
+            
+            # Partition cells
+            part.PartitionCellByDatumPlane(
+                datumPlane=part.datums[datum.id],
+                cells=part.cells[:]
+            )
+            
+            print(f'    Layer {i+1}/{num_layers-1} at Z={current_z:.2f}mm')
+        
+        print(f'  ✓ {num_layers} layers created')
+    else:
+        print('  Single layer - no partitioning')
+    
+    config.time_build = time.time() - start_time
+    print(f'  Build time: {config.time_build:.2f}s')
+    
+    return model, part
+
+
+def define_materials(model, config):
+    """Define materials with optional CDP"""
+    print('\n' + '='*70)
+    print('[2/12] DEFINING MATERIALS')
+    print('='*70)
+    
+    for i, mat_config in enumerate(config.materials):
+        mat_name = mat_config['name']
+        
+        material = model.Material(name=mat_name)
+        
+        # Elastic properties
+        E = mat_config['E']
+        nu = mat_config['nu']
+        material.Elastic(table=((E, nu), ))
+        
+        # Density
+        density = mat_config['density']
+        material.Density(table=((density * 1e-9, ), ))  # kg/m³ to tonne/mm³
+        
+        print(f'  {mat_name}: E={E} MPa, nu={nu}, rho={density} kg/m³')
+        
+        # CDP for concrete (if enabled and name contains "concrete")
+        if config.use_cdp and 'concrete' in mat_name.lower():
+            print(f'    Adding CDP parameters for {mat_name}')
+            
+            # CDP parameters
+            material.ConcreteDamagePlasticity(
+                table=((30.0, 0.1, 1.16, 0.667, 0.0001), )
+            )
+            
+            # Compression hardening
+            fc = E / 500.0  # Approximate compressive strength
+            material.concrete.ConcreteCompressionHardening(
+                table=((fc*0.4, 0.0), (fc, 0.002), (fc*0.8, 0.0035))
+            )
+            
+            # Tension stiffening
+            ft = fc * 0.1  # Tensile strength
+            material.concrete.ConcreteTensionStiffening(
+                table=((ft, 0.0), (0.1*ft, 0.001))
+            )
+            
+            # Compression damage
+            material.concrete.concreteCompressionDamage(
+                table=((0.0, 0.0), (0.5, 0.002), (0.9, 0.005))
+            )
+            
+            # Tension damage
+            material.concrete.concreteTensionDamage(
+                table=((0.0, 0.0), (0.9, 0.001))
+            )
+            
+            print(f'    ✓ CDP configured: fc≈{fc:.1f}MPa, ft≈{ft:.1f}MPa')
+
+
+def create_sections_and_assign(model, part, config):
+    """Create sections and assign to layers"""
+    print('\n' + '='*70)
+    print('[3/12] CREATING AND ASSIGNING SECTIONS')
+    print('='*70)
+    
+    materials = config.materials
+    num_layers = config.layers['number']
+    
+    # Create sections
+    for i, mat_config in enumerate(materials):
+        section_name = f'Section-{i+1}'
+        model.HomogeneousSolidSection(
+            name=section_name,
+            material=mat_config['name'],
+            thickness=None
+        )
+        print(f'  Section-{i+1} created for {mat_config["name"]}')
+    
+    # Assign sections to layers
+    if num_layers == 1:
+        region = regionToolset.Region(cells=part.cells[:])
+        part.SectionAssignment(
+            region=region,
+            sectionName='Section-1',
+            offset=0.0,
+            offsetType=MIDDLE_SURFACE
+        )
+        print('  ✓ Section-1 assigned to entire beam')
+    else:
+        thicknesses = config.layers['thicknesses']
+        height = config.geometry['height']
+        half_h = height / 2.0
+        current_z = -half_h
+        
+        for i in range(num_layers):
+            layer_center = current_z + thicknesses[i] / 2.0
+            
+            # Find cells at this height
+            cells_at_height = []
+            for cell in part.cells:
+                center = cell.pointOn[0]
+                if abs(center[2] - layer_center) < thicknesses[i] / 2.0 * 0.9:
+                    cells_at_height.append(cell)
+            
+            if cells_at_height:
+                region = regionToolset.Region(cells=cells_at_height)
+                part.SectionAssignment(
+                    region=region,
+                    sectionName=f'Section-{i+1}',
+                    offset=0.0,
+                    offsetType=MIDDLE_SURFACE
+                )
+                print(f'  ✓ Section-{i+1} assigned to Layer-{i+1} '
+                      f'({len(cells_at_height)} cells)')
+            
+            current_z += thicknesses[i]
+
+
+def apply_interlayer_bonding(model, part, assembly, config):
+    """Apply bonding between layers"""
+    print('\n' + '='*70)
+    print('[4/12] APPLYING INTERLAYER BONDING')
+    print('='*70)
+    
+    num_layers = config.layers['number']
+    
+    if num_layers <= 1:
+        print('  Single layer - no bonding needed')
+        return
+    
+    bonding_type = config.bonding_type
+    print(f'  Bonding type: {bonding_type.upper()}')
+    
+    instance = assembly.instances['Beam-1']
+    thicknesses = config.layers['thicknesses']
+    height = config.geometry['height']
+    half_h = height / 2.0
+    current_z = -half_h
+    
+    # Find interface surfaces
+    interfaces = []
+    for i in range(num_layers - 1):
+        current_z += thicknesses[i]
+        
+        # Find faces at interface
+        interface_faces = []
+        for face in instance.faces:
+            center = face.pointOn[0]
+            if abs(center[2] - current_z) < 0.1:
+                interface_faces.append(face)
+        
+        if interface_faces:
+            interfaces.append((i, current_z, interface_faces))
+    
+    print(f'  Found {len(interfaces)} interfaces')
+    
+    # Apply bonding
+    if bonding_type == 'tie':
+        for i, z_coord, faces in interfaces:
+            # Split faces into master and slave
+            master_faces = [f for f in faces if f.pointOn[0][2] < z_coord + 0.05]
+            slave_faces = [f for f in faces if f.pointOn[0][2] > z_coord - 0.05]
+            
+            if master_faces and slave_faces:
+                master_region = regionToolset.Region(side1Faces=master_faces)
+                slave_region = regionToolset.Region(side1Faces=slave_faces)
+                
+                model.Tie(
+                    name=f'Tie-{i+1}',
+                    master=master_region,
+                    slave=slave_region,
+                    positionToleranceMethod=COMPUTED,
+                    adjust=ON,
+                    tieRotations=ON,
+                    thickness=ON
+                )
+                print(f'    Tie-{i+1} at Z={z_coord:.2f}mm')
+        
+        print(f'  ✓ {len(interfaces)} tie constraints created')
+    
+    elif bonding_type == 'cohesive':
+        print('    ⚠ Cohesive zone modeling requires special elements')
+        print('    Using tie constraint as fallback for this implementation')
+        # Fallback to tie for simplified implementation
+        for i, z_coord, faces in interfaces:
+            master_faces = [f for f in faces if f.pointOn[0][2] < z_coord + 0.05]
+            slave_faces = [f for f in faces if f.pointOn[0][2] > z_coord - 0.05]
+            
+            if master_faces and slave_faces:
+                master_region = regionToolset.Region(side1Faces=master_faces)
+                slave_region = regionToolset.Region(side1Faces=slave_faces)
+                
+                model.Tie(
+                    name=f'Cohesive-{i+1}',
+                    master=master_region,
+                    slave=slave_region,
+                    positionToleranceMethod=COMPUTED
+                )
+    
+    elif bonding_type == 'contact':
+        # Create interaction property
+        model.ContactProperty('InterfaceContact')
+        model.interactionProperties['InterfaceContact'].TangentialBehavior(
+            formulation=PENALTY,
+            directionality=ISOTROPIC,
+            slipRateDependency=OFF,
+            pressureDependency=OFF,
+            temperatureDependency=OFF,
+            dependencies=0,
+            table=((0.6, ), ),  # Friction coefficient
+            shearStressLimit=None,
+            maximumElasticSlip=FRACTION,
+            fraction=0.005
+        )
+        
+        model.interactionProperties['InterfaceContact'].NormalBehavior(
+            pressureOverclosure=HARD,
+            allowSeparation=ON,
+            constraintEnforcementMethod=DEFAULT
+        )
+        
+        # Create surface-to-surface contacts
+        for i, z_coord, faces in interfaces:
+            master_faces = [f for f in faces if f.pointOn[0][2] < z_coord + 0.05]
+            slave_faces = [f for f in faces if f.pointOn[0][2] > z_coord - 0.05]
+            
+            if master_faces and slave_faces:
+                master_surf = assembly.Surface(
+                    side1Faces=master_faces,
+                    name=f'MasterSurf-{i+1}'
+                )
+                slave_surf = assembly.Surface(
+                    side1Faces=slave_faces,
+                    name=f'SlaveSurf-{i+1}'
+                )
+                
+                model.SurfaceToSurfaceContactStd(
+                    name=f'Contact-{i+1}',
+                    createStepName='Initial',
+                    master=master_surf,
+                    slave=slave_surf,
+                    sliding=FINITE,
+                    thickness=ON,
+                    interactionProperty='InterfaceContact',
+                    adjustMethod=NONE
+                )
+                print(f'    Contact-{i+1} at Z={z_coord:.2f}mm (μ=0.6)')
+        
+        print(f'  ✓ {len(interfaces)} frictional contacts created')
+
+
+def mesh_model(part, config):
+    """Mesh the part"""
+    print('\n' + '='*70)
+    print('[5/12] MESHING')
+    print('='*70)
+    
+    start_time = time.time()
+    
+    mesh_config = config.mesh
+    seed_size = mesh_config['seed_size']
+    element_type = mesh_config['element_type']
+    
+    # Seed part
+    part.seedPart(size=seed_size, deviationFactor=0.1, minSizeFactor=0.1)
+    print(f'  Global seed size: {seed_size} mm')
+    
+    # Set element type
+    elem_type = mesh.ElemType(
+        elemCode=getattr(mesh, element_type),
+        elemLibrary=STANDARD,
+        secondOrderAccuracy=OFF,
+        distortionControl=DEFAULT
+    )
+    
+    region = regionToolset.Region(cells=part.cells[:])
+    part.setElementType(regions=region, elemTypes=(elem_type,))
+    print(f'  Element type: {element_type}')
+    
+    # Try structured mesh first
+    try:
+        part.setMeshControls(
+            regions=part.cells[:],
+            technique=STRUCTURED
+        )
+        print('  Mesh control: STRUCTURED')
+    except:
+        part.setMeshControls(
+            regions=part.cells[:],
+            technique=FREE
+        )
+        print('  Mesh control: FREE (structured failed)')
+    
+    # Generate mesh
+    part.generateMesh()
+    
+    num_elements = len(part.elements)
+    num_nodes = len(part.nodes)
+    
+    print(f'  ✓ Mesh generated: {num_elements} elements, {num_nodes} nodes')
+    
+    # Check elements per layer
+    num_layers = config.layers['number']
+    if num_layers > 1:
+        avg_elem_per_layer = num_elements / float(num_layers)
+        if avg_elem_per_layer < 3:
+            print(f'  ⚠ WARNING: Average elements per layer = {avg_elem_per_layer:.1f}')
+            print('    Consider reducing seed size for better results')
+    
+    config.time_mesh = time.time() - start_time
+    print(f'  Mesh time: {config.time_mesh:.2f}s')
+
+
+def create_assembly(model, part):
+    """Create assembly"""
+    print('\n' + '='*70)
+    print('[6/12] CREATING ASSEMBLY')
+    print('='*70)
+    
+    assembly = model.rootAssembly
+    assembly.DatumCsysByDefault(CARTESIAN)
+    assembly.Instance(name='Beam-1', part=part, dependent=ON)
+    
+    print('  ✓ Assembly created with instance Beam-1')
+    
+    return assembly
+
+
+def create_static_step(model, config):
+    """Create static analysis step"""
+    print('\n' + '='*70)
+    print('[7/12] CREATING STATIC STEP')
+    print('='*70)
+    
+    if config.analysis_type == 'nonlinear_static':
+        model.StaticStep(
+            name='Step-1',
+            previous='Initial',
+            description='Nonlinear static loading',
+            nlgeom=ON,
+            maxNumInc=100,
+            initialInc=0.01,
+            minInc=1e-10,
+            maxInc=0.1
+        )
+        print('  Static step: NONLINEAR (large deformation ON)')
+    else:
+        model.StaticStep(
+            name='Step-1',
+            previous='Initial',
+            description='Linear static loading',
+            nlgeom=OFF
+        )
+        print('  Static step: LINEAR')
+    
+    # Field outputs
+    model.fieldOutputRequests['F-Output-1'].setValues(
+        variables=('S', 'E', 'U', 'RF', 'CF')
+    )
+    
+    print('  ✓ Output requests configured')
+
+
+def apply_boundary_conditions(model, assembly, config):
+    """Apply boundary conditions"""
+    print('\n' + '='*70)
+    print('[8/12] APPLYING BOUNDARY CONDITIONS')
+    print('='*70)
+    
+    bc_config = config.boundary_conditions
+    length = config.geometry['length']
+    
+    instance = assembly.instances['Beam-1']
+    
+    # Left end
+    left_faces = [f for f in instance.faces if abs(f.pointOn[0][0]) < 1e-6]
+    
+    if left_faces:
+        left_region = regionToolset.Region(faces=left_faces)
+        
+        if bc_config['left'] == 'fixed':
+            model.EncastreBC(
+                name='BC-Left',
+                createStepName='Initial',
+                region=left_region
+            )
+            print('  Left end (X=0): FIXED (all DOF)')
+        
+        elif bc_config['left'] == 'pinned':
+            model.DisplacementBC(
+                name='BC-Left',
+                createStepName='Initial',
+                region=left_region,
+                u1=0.0, u2=0.0, u3=0.0,
+                ur1=UNSET, ur2=UNSET, ur3=UNSET
+            )
+            print('  Left end (X=0): PINNED (U1=U2=U3=0)')
+    
+    # Right end
+    if bc_config['right'] != 'free':
+        right_faces = [f for f in instance.faces 
+                      if abs(f.pointOn[0][0] - length) < 1e-6]
+        
+        if right_faces:
+            right_region = regionToolset.Region(faces=right_faces)
+            
+            if bc_config['right'] == 'pinned':
+                model.DisplacementBC(
+                    name='BC-Right',
+                    createStepName='Initial',
+                    region=right_region,
+                    u1=0.0, u2=0.0, u3=0.0,
+                    ur1=UNSET, ur2=UNSET, ur3=UNSET
+                )
+                print(f'  Right end (X={length}): PINNED (U1=U2=U3=0)')
+    else:
+        print(f'  Right end (X={length}): FREE')
+
+
+def apply_load(model, assembly, config):
+    """Apply loads"""
+    print('\n' + '='*70)
+    print('[9/12] APPLYING LOADS')
+    print('='*70)
+    
+    load_config = config.loading
+    load_type = load_config['type']
+    magnitude = load_config['magnitude']
+    direction = load_config['direction']
+    
+    instance = assembly.instances['Beam-1']
+    length = config.geometry['length']
+    
+    # Direction vector
+    dir_vec = {
+        'X': (1.0, 0.0, 0.0),
+        'Y': (0.0, 1.0, 0.0),
+        'Z': (0.0, 0.0, 1.0)
+    }[direction]
+    
+    if load_type == 'point':
+        # Find right end face
+        right_faces = [f for f in instance.faces 
+                      if abs(f.pointOn[0][0] - length) < 1e-6]
+        
+        if right_faces:
+            # Get vertices on right face
+            vertices = []
+            for face in right_faces:
+                face_edges = face.getEdges()
+                for edge_idx in face_edges:
+                    edge = instance.edges[edge_idx]
+                    v_indices = edge.getVertices()
+                    for v_idx in v_indices:
+                        v = instance.vertices[v_idx]
+                        if v not in vertices:
+                            vertices.append(v)
+            
+            if vertices:
+                # Find centroid
+                sum_y = sum(v.pointOn[0][1] for v in vertices)
+                sum_z = sum(v.pointOn[0][2] for v in vertices)
+                centroid_y = sum_y / len(vertices)
+                centroid_z = sum_z / len(vertices)
+                
+                # Find closest vertex to centroid
+                min_dist = float('inf')
+                closest_v = vertices[0]
+                for v in vertices:
+                    dist = (v.pointOn[0][1] - centroid_y)**2 + (v.pointOn[0][2] - centroid_z)**2
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_v = v
+                
+                region = regionToolset.Region(vertices=(closest_v,))
+                
+                model.ConcentratedForce(
+                    name='Load-1',
+                    createStepName='Step-1',
+                    region=region,
+                    cf1=magnitude * dir_vec[0],
+                    cf2=magnitude * dir_vec[1],
+                    cf3=magnitude * dir_vec[2]
+                )
+                print(f'  Point load: {magnitude} N at free end, direction {direction}')
+    
+    elif load_type == 'distributed':
+        # Find top face
+        height = config.geometry['height']
+        top_faces = [f for f in instance.faces 
+                    if f.pointOn[0][1] > height/4.0]
+        
+        if top_faces:
+            region = regionToolset.Region(side1Faces=top_faces)
+            
+            # Convert to pressure
+            area = length * config.geometry['width']
+            pressure = magnitude / area
+            
+            model.Pressure(
+                name='Load-1',
+                createStepName='Step-1',
+                region=region,
+                magnitude=pressure
+            )
+            print(f'  Distributed load: {magnitude} N → {pressure:.4f} MPa pressure')
+
+
+def run_static_analysis(model, config):
+    """Create and run static job"""
+    print('\n' + '='*70)
+    print('[10/12] RUNNING STATIC ANALYSIS')
+    print('='*70)
+    
+    start_time = time.time()
+    
+    job_name = config.output['job_name']
+    
+    # Create job
+    mdb.Job(
+        name=job_name,
+        model=model.name,
+        description='Unified beam analysis',
+        type=ANALYSIS,
+        memory=90,
+        memoryUnits=PERCENTAGE,
+        getMemoryFromAnalysis=True
+    )
+    
+    print(f'  Job created: {job_name}')
+    print('  Submitting job...')
+    
+    # Submit and wait
+    try:
+        mdb.jobs[job_name].submit(consistencyChecking=OFF)
+        mdb.jobs[job_name].waitForCompletion()
+        
+        config.time_solve = time.time() - start_time
+        
+        print(f'  ✓ Analysis complete')
+        print(f'  Solve time: {config.time_solve:.2f}s')
+        
+        return job_name
+        
+    except Exception as e:
+        print(f'  ❌ Job failed: {e}')
+        raise
+
+
+def run_modal_analysis(model, config):
+    """Run modal analysis"""
+    if not config.modal['enabled']:
+        return None
+    
+    print('\n' + '='*70)
+    print('[11/12] RUNNING MODAL ANALYSIS')
+    print('='*70)
+    
+    num_modes = config.modal['num_modes']
+    
+    # Create frequency step
+    model.FrequencyStep(
+        name='Step-Modal',
+        previous='Step-1',
+        description='Modal analysis',
+        eigensolver=LANCZOS,
+        numEigen=num_modes,
+        shift=0.0
+    )
+    
+    print(f'  Frequency step created: {num_modes} modes')
+    
+    # Create new job for modal
+    job_name = config.output['job_name'] + '_modal'
+    
+    mdb.Job(
+        name=job_name,
+        model=model.name,
+        description='Modal analysis',
+        type=ANALYSIS,
+        memory=90,
+        memoryUnits=PERCENTAGE
+    )
+    
+    print(f'  Modal job created: {job_name}')
+    print('  Submitting modal analysis...')
+    
+    try:
+        mdb.jobs[job_name].submit(consistencyChecking=OFF)
+        mdb.jobs[job_name].waitForCompletion()
+        
+        print('  ✓ Modal analysis complete')
+        
+        return job_name
+        
+    except Exception as e:
+        print(f'  ⚠ Modal analysis failed: {e}')
+        return None
+
+
+def extract_results(config):
+    """Extract results from ODB"""
+    if not config.output['extract_results']:
+        return None
+    
+    print('\n' + '='*70)
+    print('[12/12] EXTRACTING RESULTS')
+    print('='*70)
+    
+    job_name = config.output['job_name']
+    odb_path = job_name + '.odb'
+    
+    if not os.path.exists(odb_path):
+        print(f'  ⚠ ODB file not found: {odb_path}')
+        return None
+    
+    results = {}
+    
+    try:
+        odb = odbAccess.openOdb(path=odb_path, readOnly=True)
+        
+        # Static results
+        step = odb.steps['Step-1']
+        frame = step.frames[-1]
+        
+        # Max stress
+        stress_field = frame.fieldOutputs.get('S')
+        if stress_field:
+            mises = stress_field.getScalarField(invariant=MISES)
+            max_stress = max(mises.values, key=lambda x: x.data)
+            results['max_stress_MPa'] = max_stress.data
+            results['max_stress_location'] = max_stress.position
+            print(f'  Max von Mises: {max_stress.data:.2f} MPa')
+            print(f'    Location: {max_stress.position}')
+        
+        # Max deflection
+        disp_field = frame.fieldOutputs.get('U')
+        if disp_field:
+            max_disp = 0.0
+            max_disp_vec = None
+            max_disp_pos = None
+            
+            for val in disp_field.values:
+                mag = math.sqrt(val.data[0]**2 + val.data[1]**2 + val.data[2]**2)
+                if mag > max_disp:
+                    max_disp = mag
+                    max_disp_vec = val.data
+                    max_disp_pos = val.position
+            
+            results['max_deflection_mm'] = max_disp
+            results['deflection_vector'] = list(max_disp_vec)
+            results['deflection_location'] = max_disp_pos
+            print(f'  Max deflection: {max_disp:.4f} mm')
+            print(f'    Components [X,Y,Z]: '
+                  f'[{max_disp_vec[0]:.4f}, {max_disp_vec[1]:.4f}, {max_disp_vec[2]:.4f}]')
+            print(f'    Location: {max_disp_pos}')
+        
+        odb.close()
+        
+        # Modal results (if exists)
+        modal_job = job_name + '_modal'
+        modal_odb = modal_job + '.odb'
+        
+        if os.path.exists(modal_odb):
+            odb_modal = odbAccess.openOdb(path=modal_odb, readOnly=True)
+            step_modal = odb_modal.steps['Step-Modal']
+            
+            frequencies = []
+            for frame in step_modal.frames[1:]:  # Skip frame 0
+                desc = frame.description
+                # Extract frequency from description
+                try:
+                    if 'frequency' in desc.lower():
+                        freq_str = desc.split('=')[-1].split()[0]
+                        freq = float(freq_str)
+                        frequencies.append(freq)
+                except:
+                    pass
+            
+            results['frequencies_Hz'] = frequencies
+            
+            print(f'\n  Natural Frequencies:')
+            for i, freq in enumerate(frequencies, 1):
+                print(f'    Mode {i}: {freq:.2f} Hz')
+            
+            odb_modal.close()
+        
+        print('\n  ✓ Results extracted')
+        
+    except Exception as e:
+        print(f'  ⚠ Extraction error: {e}')
+        return None
+    
+    return results
+
+
+def export_csv(results, config):
+    """Export results to CSV"""
+    if not config.output['export_csv'] or results is None:
+        return
+    
+    print('\n' + '='*70)
+    print('EXPORTING TO CSV')
+    print('='*70)
+    
+    job_name = config.output['job_name']
+    csv_file = job_name + '_results.csv'
+    
+    try:
+        with open(csv_file, 'w') as f:
+            writer = csv.writer(f)
+            
+            # Header
+            writer.writerow(['Result Type', 'Value', 'Unit'])
+            
+            # Static results
+            if 'max_stress_MPa' in results:
+                writer.writerow(['Max von Mises Stress', 
+                               '%.2f' % results['max_stress_MPa'], 'MPa'])
+            
+            if 'max_deflection_mm' in results:
+                writer.writerow(['Max Deflection', 
+                               '%.4f' % results['max_deflection_mm'], 'mm'])
+            
+            # Modal results
+            if 'frequencies_Hz' in results:
+                writer.writerow([])
+                writer.writerow(['Mode', 'Frequency', 'Hz'])
+                for i, freq in enumerate(results['frequencies_Hz'], 1):
+                    writer.writerow([i, '%.2f' % freq, ''])
+        
+        print(f'  ✓ CSV exported: {csv_file}')
+        
+    except Exception as e:
+        print(f'  ⚠ CSV export failed: {e}')
+
+
+def validate_analytical(results, config):
+    """Validate with analytical beam theory"""
+    if not config.output['validate_analytical'] or results is None:
+        return
+    
+    if 'max_deflection_mm' not in results or 'max_stress_MPa' not in results:
+        print('\n  ⚠ Insufficient data for analytical validation')
+        return
+    
+    print('\n' + '='*70)
+    print('ANALYTICAL VALIDATION')
+    print('='*70)
+    
+    # Check if cantilever
+    if config.boundary_conditions['left'] != 'fixed' or \
+       config.boundary_conditions['right'] != 'free':
+        print('  ⚠ Analytical validation only for cantilever beams')
+        return
+    
+    # Beam properties
+    L = config.geometry['length']
+    b = config.geometry['width']
+    h = config.geometry['height']
+    
+    # Use first layer material (approximation for multi-layer)
+    E = config.materials[0]['E']
+    
+    # Second moment of area
+    I = b * h**3 / 12.0
+    c = h / 2.0
+    
+    # Load
+    P = config.loading['magnitude']
+    
+    # Analytical solutions
+    delta_analytical = P * L**3 / (3.0 * E * I)
+    sigma_analytical = P * L * c / I
+    
+    # FEA results
+    delta_fea = results['max_deflection_mm']
+    sigma_fea = results['max_stress_MPa']
+    
+    # Errors
+    delta_error = abs(delta_fea - delta_analytical) / delta_analytical * 100
+    sigma_error = abs(sigma_fea - sigma_analytical) / sigma_analytical * 100
+    
+    print(f'\n  Cantilever Beam Theory (P={P}N, L={L}mm)')
+    print(f'  I = {I:.0f} mm⁴, c = {c:.2f} mm')
+    
+    print(f'\n  DEFLECTION:')
+    print(f'    Analytical: {delta_analytical:.4f} mm')
+    print(f'    FEA:        {delta_fea:.4f} mm')
+    print(f'    Error:      {delta_error:.2f}%')
+    
+    print(f'\n  STRESS:')
+    print(f'    Analytical: {sigma_analytical:.2f} MPa')
+    print(f'    FEA:        {sigma_fea:.2f} MPa')
+    print(f'    Error:      {sigma_error:.2f}%')
+    
+    if delta_error > 10 or sigma_error > 10:
+        print(f'\n  ⚠ WARNING: Error > 10%')
+        print('    Possible causes:')
+        print('    - Insufficient mesh refinement')
+        print('    - Multi-layer effects')
+        print('    - Load application location')
+    else:
+        print(f'\n  ✓ Results validated (error < 10%)')
+
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+def main():
+    """Main execution function"""
+    
+    print('\n' + '🔷'*35)
+    print('  UNIFIED BEAM ANALYZER')
+    print('  Complete Automated Framework')
+    print('🔷'*35)
+    
+    start_total = time.time()
+    
+    # Step 1: Collect parameters
+    print('\n[STEP 1] Launching parameter collection GUI...')
+    gui = ParameterGUI()
+    config = gui.show()
+    
+    if config is None:
+        print('\n❌ Analysis cancelled by user')
+        return
+    
+    print('\n✓ Parameters collected')
+    
+    try:
+        # Step 2: Build geometry
+        model, part = build_geometry(config)
+        
+        # Step 3: Define materials
+        define_materials(model, config)
+        
+        # Step 4: Create sections
+        create_sections_and_assign(model, part, config)
+        
+        # Step 5: Create assembly
+        assembly = create_assembly(model, part)
+        
+        # Step 6: Apply interlayer bonding
+        apply_interlayer_bonding(model, part, assembly, config)
+        
+        # Step 7: Mesh
+        mesh_model(part, config)
+        
+        # Step 8: Create static step
+        create_static_step(model, config)
+        
+        # Step 9: Apply BCs
+        apply_boundary_conditions(model, assembly, config)
+        
+        # Step 10: Apply loads
+        apply_load(model, assembly, config)
+        
+        # Step 11: Run static analysis
+        job_name = run_static_analysis(model, config)
+        
+        # Step 12: Run modal analysis (optional)
+        run_modal_analysis(model, config)
+        
+        # Step 13: Extract results
+        results = extract_results(config)
+        
+        # Step 14: Export CSV
+        export_csv(results, config)
+        
+        # Step 15: Analytical validation
+        validate_analytical(results, config)
+        
+        # Performance summary
+        config.time_total = time.time() - start_total
+        
+        print('\n' + '='*70)
+        print('PERFORMANCE SUMMARY')
+        print('='*70)
+        print(f'  Build time:  {config.time_build:.2f}s')
+        print(f'  Mesh time:   {config.time_mesh:.2f}s')
+        print(f'  Solve time:  {config.time_solve:.2f}s')
+        print(f'  Total time:  {config.time_total:.2f}s')
+        
+        # Final success message
+        print('\n' + '='*70)
+        print('✅ SUCCESS: Unified Beam Analyzer Completed')
+        print('='*70)
+        print('\nResults saved to:')
+        print(f'  {job_name}.odb')
+        if config.output['export_csv']:
+            print(f'  {job_name}_results.csv')
+        print('\nView results:')
+        print(f'  abaqus viewer odb={job_name}.odb')
+        print('='*70)
+        
+    except Exception as e:
+        print('\n' + '='*70)
+        print('❌ ERROR OCCURRED')
+        print('='*70)
+        print(f'  {str(e)}')
+        import traceback
+        traceback.print_exc()
+        print('\n  Analysis terminated')
+
+
+# Entry point
+if __name__ == '__main__':
+    main()
